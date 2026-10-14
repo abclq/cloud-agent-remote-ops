@@ -37,6 +37,7 @@
 - [检测的四种状态](#-检测的四种状态) —— 连不上 ≠ 服务挂了
 - [告警与回执](#-告警与回执) —— 它凭什么判断"联系不上你"
 - [⚠️ 效果边界](#️-效果边界诚实说明) —— **先看这个**
+- [🔗 相关项目 & 我们学到了什么](#-相关项目--我们学到了什么) —— 同类项目翻了一遍，抄回来 8 条
 - [部署](#-部署) · [目录结构](#-目录结构) · [贡献](#-贡献) · [License](#-license)
 - [📚 **docs/ 文档索引**](docs/README.md)
 
@@ -99,8 +100,36 @@
 再配合这几个 sshd 选项，**物理上就开不了 shell**：
 
 ```
-command="/path/to/entry.sh",no-pty,no-port-forwarding,no-agent-forwarding,no-X11-forwarding
+command="/path/to/entry.sh",restrict
 ```
+
+> 💡 OpenSSH 7.2+ 有 **`restrict`** 一个词，等价于
+> `no-pty,no-port-forwarding,no-agent-forwarding,no-X11-forwarding`，
+> 而且以后 OpenSSH 新增的会话特性也会**自动一并关掉** —— 比手写四个更安全。
+
+### ⚠️ 但 `command=` 有个洞：账号自己能改
+
+`authorized_keys` 是**账号自己**拥有的文件。一旦你给了它写权限（比如为了 `exec`），
+它就能把自己那行 `command=` 改掉，或者干脆**加一把新钥匙** —— 护栏形同虚设。
+
+**解法**：改用 sshd 的 **`ForceCommand`**（写在 `sshd_config` 的 `Match` 块里，**服务端强制**）：
+
+```sshconfig
+Match User your-user
+    ForceCommand /usr/local/bin/agent-entry.sh
+    PermitTTY no
+    X11Forwarding no
+    AllowTcpForwarding no
+```
+
+| 方式 | 谁设的 | 范围 | 账号能改吗 |
+|---|---|---|---|
+| `authorized_keys` 的 `command=` | 账号自己 | 单把钥匙 | ✅ **能改**（改自己的文件） |
+| `sshd_config` 的 `ForceCommand` | 管理员 root | 整个用户 | ❌ **改不掉** |
+| 受限 shell（`chsh -s`） | 管理员 root | 整个账号 | ❌ 改不掉 |
+
+**结论**：要挡住「它改自己的护栏」，只有 `ForceCommand` / 受限 shell 这条路。
+`command=` 适合你自己完全掌控的场景；**一旦给了对面写权限，就该上 `ForceCommand`**。
 
 ---
 
@@ -333,6 +362,73 @@ sudo grep -rl <它的脚本名> /etc/systemd/system /usr/lib/systemd/system 2>/d
 
 ---
 
+## 🔗 相关项目 & 我们学到了什么
+
+做之前先把同类翻了一遍。**下面这几条是抄回来的**（附出处）：
+
+### 直接改变了我们设计的三条
+
+**① `ForceCommand` + `Match` —— 补掉「账号自己改护栏」的洞**
+出自 OpenSSH 官方文档 / [hvr.biz 的 forced command 长文](https://hvr.biz/topic.php?slug=restrict-an-ssh-key-to-one-command-forced-commands)。
+我们原本用 `authorized_keys` 的 `command=`，搜到这篇才知道**账号自己改得掉**。
+
+**② 修复前自动备份 + 验证失败自动回滚**
+出自 [`SentinelMCP`](https://github.com/AnantharamanKV/SentinalMCP)。
+它的做法：改配置前存 checksum 备份，改完验证；**验证不过就自动还原**。
+我们原本的 `autofix.py` 只重启服务，没备份。
+
+**③ 无限循环断路器：同一问题失败 2 次就停**
+同样出自 `SentinelMCP`。按「诊断指纹」记历史，**同一个指纹失败 ≥2 次 → 降低置信度 / 直接封策略**。
+比"无限重试"和"无限告警"都聪明。
+
+### 告警体验上抄的两条
+
+**④ 通知去重** —— 出自 [`psyduckler/self-healing-agents`](https://github.com/psyduckler/self-healing-agents)
+它的规则：**同一个 heal 报过就不再报，除非复发**（说明上次的修复没 hold 住）。
+这正是我们要的「别一直提示我」。
+
+**⑤ 风险评分分流** —— 同一个项目
+`≤0.3` 自动修 · `0.3–0.8` 修完盯紧 · `>0.8` 交人。
+比我们「能修就修」更细。
+
+**⑥ 级联失败检测** —— 还是它
+3 个 cron 同时挂 → 判定**一个根因**，不是 3 个问题。避免告警风暴。
+
+### 护栏上更高级的思路
+
+**⑦ AST 解析代替正则黑名单** —— 出自 [`sunir/bashguard`](https://github.com/sunir/bashguard)
+用 tree-sitter 把命令**解析成语法树**再判，而不是正则匹配字符串 —— 绕过难度高一个量级。
+它还拦「试图改 bashguard 自己」，思路和我们一样，但实现更硬。
+
+**⑧ 凭据占位符注入** —— 同一个项目
+agent 写 `curl -H "Authorization: Bearer {{GITHUB_TOKEN}}"`，
+**真值在执行时才替换** → agent 从来看不到真 token。
+比我们「关键字拦凭据路径」干净得多，**下一步想上这个**。
+
+### 同类项目速查
+
+| 项目 | 是什么 | 我们参考了什么 |
+|---|---|---|
+| [`SentinelMCP`](https://github.com/AnantharamanKV/SentinalMCP) | MCP server，检测→诊断→修复→验证，支持远程 SSH | 备份回滚、循环断路器 |
+| [`psyduckler/self-healing-agents`](https://github.com/psyduckler/self-healing-agents) | agent 自愈框架，known-fixes DB | 通知去重、风险评分、级联检测 |
+| [`sunir/bashguard`](https://github.com/sunir/bashguard) | LLM 的 bash 拦截器（AST） | AST 解析、凭据占位符 |
+| [`bdsh`](https://github.com/RaymiiOrg/boa-diminish-restricted-shell) | 白名单受限 shell，带日志 | 受限 shell 的成熟做法 |
+| [`secureshell`](https://github.com/stevewithington/secureshell) / [`cmdguard`](https://github.com/JSLEEKR/cmdguard) / [`agentguard`](https://github.com/alvabillwu/agentguard) | 命令网关，GREEN/YELLOW/RED 分级 | 分级思路 |
+| [`awesome-agent-sandboxes`](https://github.com/arjan/awesome-agent-sandboxes) | 沙箱方案合集 | 想上硬隔离时翻这个 |
+| `git-shell` | OpenSSH 自带的受限 shell | 官方参考实现 |
+
+### 我们和它们不一样的地方
+
+上面这一堆，**没有一个处理「连不上 ≠ 服务挂了」**。
+
+它们都会在你**自己关机、断网、换 Wi-Fi** 的时候照样告警 ——
+而我们的[四态判定](#检测的四种状态)第一句就是：
+**连不上默认静默，只有「连上了 + 真有故障」才吵你。**
+
+这一条是我们自己的（也是被真实生活逼出来的）。
+
+---
+
 ## 部署
 
 ### 1. 服务器侧
@@ -351,11 +447,32 @@ sudo mkdir -p /var/log/agent-entry && sudo chown "$USER" /var/log/agent-entry
 
 ### 2. 锁死那把钥匙
 
-在 `~/.ssh/authorized_keys` 里加一条（**注意 `command=` 指向 root 拥有的入口**）：
+**方案 A（简单）** —— 在 `~/.ssh/authorized_keys` 里加一条（**`command=` 指向 root 拥有的入口**）：
 
 ```
-command="/usr/local/bin/agent-entry.sh",no-pty,no-port-forwarding,no-agent-forwarding,no-X11-forwarding ssh-ed25519 AAAA…cloud-agent
+command="/usr/local/bin/agent-entry.sh",restrict ssh-ed25519 AAAA…cloud-agent
 ```
+
+⚠️ 但这个方案**账号自己改得掉**（见上文架构节的洞）。它只适合你自己完全掌控账号的场景。
+
+**方案 B（推荐 —— 给对面写权限时必须用这个）** —— 在 `/etc/ssh/sshd_config` 里用 `Match` 块：
+
+```sshconfig
+Match User your-user
+    ForceCommand /usr/local/bin/agent-entry.sh
+    PermitTTY no
+    X11Forwarding no
+    AllowTcpForwarding no
+    PermitOpen none
+```
+
+```bash
+# 改完先验证语法，再 reload（别直接 restart，语法错会把自己关在门外）
+sudo sshd -t && sudo systemctl reload ssh
+```
+
+方案 B 的好处：**服务端强制**，账号改 `authorized_keys`、加新钥匙都逃不掉 ——
+这条也是我们给对面开了 `exec` 之后才补上的（先踩坑，后补课）。
 
 ### 3. 云端侧
 
