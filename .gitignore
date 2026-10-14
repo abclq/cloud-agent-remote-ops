@@ -1,0 +1,24 @@
+# 编辑器 / 系统
+.DS_Store
+Thumbs.db
+*.swp
+*~
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# 本地配置 / 日志（绝不入库）
+*.log
+*.local
+.env
+.env.*
+!.env.example
+secrets/
+credentials/
+
+# 部署时生成的
+*.bak
+*.bak.*
