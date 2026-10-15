@@ -60,12 +60,13 @@ exec echo 'step1; step2; step3' > ~/agent-workspace/job.sh && bash ~/agent-works
 |---|---|---|
 | **不可逆** | `rm -rf /`、`rm -rf ~`、`mkfs`、`dd of=/dev/` | 执行完没法回滚 |
 | **影响整机** | `systemctl reboot` `poweroff` `halt` `suspend` `hibernate` `kexec` | 会断掉你和它的连接，也可能断掉别人的服务 |
-| **杀进程组** | `kill -1`、`killall5` | 会杀掉不该杀的 |
+| **停服务** | `systemctl … stop` `disable` `mask` `kill` | **修复只该用 `restart`/`start`** —— 停掉网关就把通信掐断了 |
+| **杀进程** | `pkill`、`killall`、`kill <pid>`、`kill -1`、`killall5` | 广谱杀进程；修服务走 `systemctl restart` |
 | **改身份** | `sudo`、`su`、`passwd`、`chsh`、`usermod` | 提权链的第一跳 |
 | **改登录** | 写 `authorized_keys`、改 `sshd_config` | **它能给自己加钥匙** = 绕过所有护栏 |
 | **改护栏自己** | 写 `/usr/local/bin/agent-entry*` | 直接失效 |
 
-### 踩过的坑：`systemctl reboot` 漏网
+### 踩过的坑 ①：`systemctl reboot` 漏网
 
 最初的黑名单只写了 `reboot`（裸命令），忘了 `systemctl reboot`。
 
@@ -79,8 +80,31 @@ kill\s+-1\b
 killall5
 ```
 
-**教训**：黑名单要按**语义**列，不是按**字面命令名**列。
-凡是"能达到这个效果"的写法都要覆盖。
+### 踩过的坑 ②：`systemctl stop` 也漏了
+
+补完 `reboot` 之后，又发现 `exec systemctl --user stop <网关>` **是放行的** 🔴
+
+（那次只是碰巧没生效 —— 写的是 `--user`，而网关是系统级单元。换个写法就真停掉了。）
+
+**风险**：对面 AI 只要 `stop` 一下网关，**我们之间的通信就断了** ——
+而它自己可能还以为在"修复"。
+
+补上：
+
+```bash
+systemctl[^|;&]*\s(stop|disable|mask|kill)\b
+(^|[;&|\s])(pkill|killall|kill)\s
+```
+
+**口径**：**修复只该用 `restart` / `start`**，不该有"停"这个动作。
+`disable` / `mask` 更狠 —— 停了还回不来。
+
+### 两条教训
+
+1. **黑名单要按「语义」列，不是按「字面命令名」列。**
+   凡是"能达到这个效果"的写法都要覆盖。
+2. **要按「破坏力」想，不是按「名字像不像」想。**
+   `restart` 和 `stop` 名字长得像，破坏力天差地别。
 
 ---
 
