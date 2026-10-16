@@ -14,16 +14,34 @@
 
 ---
 
-## 第 1 步：写入口脚本
+## 第 1 步：建专用账号，写入口脚本
 
 ```bash
-sudo mkdir -p /usr/local/bin
+# 专给 AI 的账号。不要复用你自己的账号：
+#   - 第 3 步的 ForceCommand 按「用户」生效，会把你自己的钥匙也锁死
+#   - 提权链审查要对「它」做，你自己的账号通常有 sudo，审不过
+sudo useradd -m -s /bin/bash agent-ops
+sudo mkdir -p /usr/local/lib/agent      # 后面 do-*.sh 都放这里，root 拥有
+```
+
+```bash
 sudo tee /usr/local/bin/agent-entry.sh >/dev/null <<'EOF'
 #!/usr/bin/env bash
 # 云端 AI 的唯一入口。只认具名动作。
 set -uo pipefail
 
-ACTION="${1:-help}"
+# 用 command= 或 ForceCommand 时，脚本本身不带参数，
+# 对面发来的整条命令在 $SSH_ORIGINAL_COMMAND 里，必须自己拆。
+CMD="${SSH_ORIGINAL_COMMAND:-help}"
+ACTION="${CMD%% *}"
+REST=""
+[[ "$CMD" == *" "* ]] && REST="${CMD#* }"
+
+# 零参数动作带了参数 → 拒（126 = 被入口拒绝，见 actions.md）
+case "$ACTION" in
+  help|status|verify|fix)
+    [ -n "$REST" ] && { echo '{"error":"action takes no arguments"}' >&2; exit 126; } ;;
+esac
 
 case "$ACTION" in
   help)   cat <<'H'
@@ -38,15 +56,18 @@ H
   status) exec /usr/local/lib/agent/do-status.sh ;;
   verify) exec /usr/local/lib/agent/do-verify.sh ;;
   fix)    exec /usr/local/lib/agent/do-fix.sh ;;
-  exec)   exec /usr/local/lib/agent/do-exec.sh "${@:2}" ;;
-  *)      echo '{"error":"unknown action","action":"'"$ACTION"'"}' >&2; exit 2 ;;
+  exec)   exec /usr/local/lib/agent/do-exec.sh "$REST" ;;   # 护栏在 do-exec.sh 里
+  *)      echo '{"error":"unknown action"}' >&2; exit 126 ;;   # 别把对面的输入原样拼进 JSON
 esac
 EOF
 ```
 
-⚠️ **注意**：`$SSH_ORIGINAL_COMMAND` 的解析由 sshd 完成 ——
-用 `command=` 时，sshd 会把原命令塞进这个变量，而 `$1` 就是你脚本收到的第一个词。
-**具体行为随 OpenSSH 版本略有差异，上线前务必实测一次。**
+⚠️ **注意**：sshd **不会**把原命令拆成 `$1 $2 …` 传给入口脚本 —— 脚本永远没有位置参数，
+原命令只在 `$SSH_ORIGINAL_COMMAND` 里（没带命令时这个变量不存在，所以上面默认 `help`）。
+如果写成 `ACTION="${1:-help}"`，不管对面发什么都只会得到 `help`。
+
+`do-status.sh` / `do-verify.sh` / `do-fix.sh` / `do-exec.sh` 在后面几步写；
+没写之前，对应动作会报 `No such file`，这是正常的。
 
 **权限**（关键）：
 
@@ -113,28 +134,38 @@ PY
 ### 方案 A：`authorized_keys`
 
 ```bash
-# 生成专用钥匙（在云端那台机器上生成，私钥别离开它）
+# ① 在【云端】生成专用钥匙（私钥别离开它），把公钥那一行打印出来
 ssh-keygen -t ed25519 -C "cloud-agent" -f ~/.ssh/id_agent -N ""
+cat ~/.ssh/id_agent.pub
 
-# 把公钥加到本机
-echo 'command="/usr/local/bin/agent-entry.sh",restrict '"$(cat id_agent.pub)" \
-  >> ~/.ssh/authorized_keys
+# ② 在【服务器】上，把上一步打印的那一行粘进来（公钥可以随便传，私钥不行）
+PUB='ssh-ed25519 AAAA…cloud-agent'
+sudo install -d -o agent-ops -g agent-ops -m 700 ~agent-ops/.ssh
+echo "command=\"/usr/local/bin/agent-entry.sh\",restrict $PUB" \
+  | sudo tee -a ~agent-ops/.ssh/authorized_keys >/dev/null
+sudo chown agent-ops:agent-ops ~agent-ops/.ssh/authorized_keys
+sudo chmod 600 ~agent-ops/.ssh/authorized_keys
 ```
 
 ### 方案 B：`ForceCommand`（推荐，尤其当你之后要开 `exec`）
 
 ```bash
 sudo tee /etc/ssh/sshd_config.d/agent.conf >/dev/null <<'EOF'
-Match User your-user
+# ⚠️ Match 的是「整个用户」，不是某一把钥匙：必须是专给 AI 的独立账号，
+#    千万别写你自己登录用的账号，否则你自己的钥匙也会被锁成只能跑入口脚本。
+Match User agent-ops
     ForceCommand /usr/local/bin/agent-entry.sh
     PermitTTY no
-    X11Forwarding no
-    AllowTcpForwarding no
-    PermitOpen none
+    DisableForwarding yes     # OpenSSH 7.4+：TCP、Unix socket、X11、agent 转发一次全关
+    PermitTunnel no
 EOF
 
-sudo sshd -t && sudo systemctl reload ssh
+# Debian/Ubuntu 单元名是 ssh，RHEL/Fedora/Arch 是 sshd
+sudo sshd -t && (sudo systemctl reload ssh || sudo systemctl reload sshd)
 ```
+
+方案 B 同样要做方案 A 的 ①②（公钥得先进 `authorized_keys` 才登得上），
+`Match` 只决定登录后能跑什么。
 
 ⚠️ **先 `sshd -t` 验语法** —— 配错了 reload 会让 sshd 起不来，你就把自己关在外面了。
 
@@ -145,7 +176,7 @@ sudo sshd -t && sudo systemctl reload ssh
 ## 第 4 步：测（只读阶段）
 
 ```bash
-# 从云端那台机器上
+# 从云端那台机器上（2222 换成你实际暴露的端口；第一次连先核对主机指纹）
 ssh -i ~/.ssh/id_agent -p 2222 your-user@your-host 'help'
 ssh -i ~/.ssh/id_agent -p 2222 your-user@your-host 'status'
 ssh -i ~/.ssh/id_agent -p 2222 your-user@your-host 'verify' | python3 -m json.tool
@@ -154,20 +185,26 @@ ssh -i ~/.ssh/id_agent -p 2222 your-user@your-host 'verify' | python3 -m json.to
 **必须验证的**：
 
 ```bash
-# 1. 打不开 shell（应该立刻断开或拒绝）
+# 1. 打不开 shell：不带命令登录，应该打印 help 后直接断开，拿不到提示符
 ssh -i ~/.ssh/id_agent -p 2222 your-user@your-host
 
-# 2. 未知动作被拒
-ssh -i ~/.ssh/id_agent -p 2222 your-user@your-host 'rm -rf /'
-# → 期望 {"error":"unknown action"}
+# 2. 未知动作被拒（用无害的词测，别真发 rm -rf /）
+ssh -i ~/.ssh/id_agent -p 2222 your-user@your-host 'nosuchaction'; echo "rc=$?"
+# → 期望 {"error":"unknown action"}，rc=126
 
 # 3. 端口转发被关
-ssh -i ~/.ssh/id_agent -p 2222 -L 8080:localhost:80 your-user@your-host 'verify'
-# → 期望失败（restrict / AllowTcpForwarding no）
+#    注意：转发被拒时 ssh 默认只打警告、命令照跑、退出码还是 0。
+#    必须加 ExitOnForwardFailure=yes，才会真的失败。
+ssh -i ~/.ssh/id_agent -p 2222 -o ExitOnForwardFailure=yes \
+    -L 8080:localhost:80 your-user@your-host 'verify'; echo "rc=$?"
+# → 期望 rc=255，报 "port forwarding failed" / "administratively prohibited"
 
 # 4. PTY 拿不到
-ssh -i ~/.ssh/id_agent -p 2222 -t your-user@your-host 'verify'
-# → 期望失败（no-pty）
+#    同理，-t 被拒时命令照样执行；判断标准是 stderr 里出现
+#    "PTY allocation request failed"，而不是退出码。
+ssh -i ~/.ssh/id_agent -p 2222 -t your-user@your-host 'verify' 2>&1 \
+  | grep -q 'PTY allocation request failed' && echo "✅ 没拿到 PTY" || echo "🔴 拿到了 PTY"
+
 ```
 
 **四条全过 → 锁装好了。**
@@ -235,15 +272,21 @@ out=$(ssh ... 'exec systemctl --user is-active agent-selftest')
 echo "✅ 端到端通过"
 ```
 
-**再跑护栏测试**（危险命令**只做字符串验证，绝不真执行**）：
+**再跑护栏测试**。⚠️ 通过 SSH 发出去的命令就是**真执行** —— 护栏一旦漏了，
+`cat ~/.ssh/id_ed25519` 会把你的真私钥打到云端沙盒里（威胁模型里那个"半公开"的地方）。
+所以测试用例必须是**漏了也无害**的诱饵：同样的模式，打到不存在 / 无关紧要的目标上。
 
 ```bash
-for bad in 'rm -rf /' 'cat ~/.ssh/id_ed25519' 'sudo passwd nobody' \
-           'systemctl reboot' 'echo a; rm -rf /tmp/x'; do
-  out=$(ssh ... "exec $bad" 2>&1)
-  [[ "$out" == *拒绝* || "$out" == *blocked* || "$out" == *error* ]] \
-    && echo "⛔ 拦住了: $bad" || echo "🔴 漏了: $bad"
+# 先在服务器上放一个诱饵，不是真钥匙
+sudo -u agent-ops install -d -m 700 ~agent-ops/.ssh
+sudo -u agent-ops sh -c 'echo CANARY > ~/.ssh/id_canary_test'
+
+for bad in 'rm -rf /nonexistent-agent-test' 'cat ~/.ssh/id_canary_test' \
+           'sudo -n true' 'systemctl reboot --dry-run' 'echo a; true'; do
+  out=$(ssh ... "exec $bad" 2>&1); rc=$?
+  [ "$rc" -eq 126 ] && echo "⛔ 拦住了: $bad" || echo "🔴 漏了 (rc=$rc): $bad"
 done
+# 判断看退出码 126，不看输出里有没有 "error" —— 命令自己失败也会打印 error。
 ```
 
 ---

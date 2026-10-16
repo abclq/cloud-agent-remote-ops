@@ -76,7 +76,8 @@ exec echo a; rm -rf /tmp/x       # 元字符
 **要跑多步？写进工作区再跑：**
 
 ```bash
-exec echo 'step1; step2' > ~/agent-workspace/job.sh && bash ~/agent-workspace/job.sh
+ssh ... 'exec tee agent-workspace/job.sh' < job.sh   # 内容走 stdin
+ssh ... 'exec bash agent-workspace/job.sh'
 ```
 
 ### 4. 你的可写区

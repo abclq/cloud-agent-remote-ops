@@ -43,14 +43,15 @@ exec echo $(cat ~/.ssh/id_ed25519)
 
 **代价**：`exec "a && b"` 这种多步命令用不了。
 
-**补偿**：让它写进工作区再跑：
+**补偿**：脚本内容走 SSH 的**标准输入**写进工作区，远端命令里不出现任何元字符，再分两次调用：
 
 ```bash
-exec echo 'step1; step2; step3' > ~/agent-workspace/job.sh && bash ~/agent-workspace/job.sh
+ssh ... 'exec tee agent-workspace/job.sh' < job.sh     # 写（do-exec.sh 要把 stdin 接给命令）
+ssh ... 'exec bash agent-workspace/job.sh'             # 跑
 ```
 
-⚠️ 注意上面这条**本身**含 `;`（在引号里）—— 所以实践中元字符检查要**先去掉引号内容再检查**，
-或者干脆规定「要跑多步就写文件」。**两种做法各有取舍，看你愿意多复杂。**
+不要用「先去掉引号内容再检查」的办法放行 `echo '…;…' > file && bash file` ——
+引号剥离写错一个边界，元字符检查就整个失效。
 
 ---
 

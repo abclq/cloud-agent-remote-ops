@@ -104,7 +104,7 @@ command="/path/to/entry.sh",restrict
 ```
 
 > 💡 OpenSSH 7.2+ 有 **`restrict`** 一个词，等价于
-> `no-pty,no-port-forwarding,no-agent-forwarding,no-X11-forwarding`，
+> `no-pty,no-port-forwarding,no-agent-forwarding,no-X11-forwarding,no-user-rc`，
 > 而且以后 OpenSSH 新增的会话特性也会**自动一并关掉** —— 比手写四个更安全。
 
 ### ⚠️ 但 `command=` 有个洞：账号自己能改
@@ -115,18 +115,23 @@ command="/path/to/entry.sh",restrict
 **解法**：改用 sshd 的 **`ForceCommand`**（写在 `sshd_config` 的 `Match` 块里，**服务端强制**）：
 
 ```sshconfig
-Match User your-user
+# ⚠️ Match 的是「整个用户」，不是某一把钥匙：必须是专给 AI 的独立账号，
+#    千万别写你自己登录用的账号，否则你自己的钥匙也会被锁成只能跑入口脚本。
+Match User agent-ops
     ForceCommand /usr/local/bin/agent-entry.sh
     PermitTTY no
-    X11Forwarding no
-    AllowTcpForwarding no
+    DisableForwarding yes     # OpenSSH 7.4+：TCP、Unix socket、X11、agent 转发一次全关
+    PermitTunnel no
 ```
 
 | 方式 | 谁设的 | 范围 | 账号能改吗 |
 |---|---|---|---|
 | `authorized_keys` 的 `command=` | 账号自己 | 单把钥匙 | ✅ **能改**（改自己的文件） |
-| `sshd_config` 的 `ForceCommand` | 管理员 root | 整个用户 | ❌ **改不掉** |
+| `sshd_config` 的 `ForceCommand` | 管理员 root | 整个用户（所以必须是独立账号） | ❌ **改不掉** |
 | 受限 shell（`chsh -s`） | 管理员 root | 整个账号 | ❌ 改不掉 |
+
+> ⚠️ 只写 `AllowTcpForwarding no` 不够：它**不管 Unix socket 转发**（`AllowStreamLocalForwarding` 默认是开的）。
+> 对面可以 `ssh -L 2375:/var/run/docker.sock …` 直接摸到 docker，这就是 root。用 `DisableForwarding yes` 一次关全。
 
 **结论**：要挡住「它改自己的护栏」，只有 `ForceCommand` / 受限 shell 这条路。
 `command=` 适合你自己完全掌控的场景；**一旦给了对面写权限，就该上 `ForceCommand`**。
@@ -174,7 +179,8 @@ ssh -p 2222 user@host "help"      # 动作清单
 
 ```bash
 ssh -p 2222 user@host 'exec systemctl --user restart my-service'
-ssh -p 2222 user@host 'exec cat > ~/agent-workspace/fix.sh << "EOF" ... EOF'
+# 写文件：内容走 SSH 的标准输入，远端命令里不出现任何元字符
+ssh -p 2222 user@host 'exec tee agent-workspace/fix.sh' < fix.sh
 ```
 
 **代价与收益**：
@@ -225,7 +231,7 @@ curl … | bash     wget … | bash
         curl|bash · 改 authorized_keys · systemctl reboot · kill -9 -1
 ⛔ 拦掉：cat ~/.hermes/shared/x · grep token ~/.hermes/shared · cat ~/.ssh/id_ed25519
 ✅ 放行：systemctl --user restart x · journalctl -u x -n 50 · df -h
-        du -sh ~/* | sort -h | tail -3
+        （含 | ; > 等元字符的一律拒，多步操作写进工作区脚本再跑）
 ```
 
 ---
@@ -434,16 +440,22 @@ agent 写 `curl -H "Authorization: Bearer {{GITHUB_TOKEN}}"`，
 ### 1. 服务器侧
 
 ```bash
-# 入口脚本（root 拥有、只读 —— 关键！）
+# 专用账号（别用你自己的账号：ForceCommand 按用户生效，提权链审查也按这个账号做）
+sudo useradd -m -s /bin/bash agent-ops
+
+# 入口脚本（root 拥有、只读 —— 关键！）脚本内容见 docs/deploy.md 第 1 步
 sudo install -o root -g root -m 0755 entry.sh /usr/local/bin/agent-entry.sh
-sudo install -o root -g root -m 0755 guard.sh /usr/local/bin/agent-guard.sh
 
 # 工作区（它可写）
-mkdir -p ~/agent-workspace
+sudo -u agent-ops mkdir -p ~agent-ops/agent-workspace
 
-# 审计目录
-sudo mkdir -p /var/log/agent-entry && sudo chown "$USER" /var/log/agent-entry
+# 审计：写进 journald（logger），而不是一个它自己可写的目录 —— 否则它能删掉自己的记录
+#   入口脚本里：logger -t agent-entry -- "rc=$rc cmd=$cmd"
+#   查看：      sudo journalctl -t agent-entry
 ```
+
+> ⚠️ 如果走 FRP / 反向隧道，sshd 看到的来源 IP 都是 `127.0.0.1`，审计里的 `from=` 区分不了人。
+> 想区分是哪把钥匙，在 `sshd_config` 里设 `LogLevel VERBOSE`，sshd 会记下每次登录用的公钥指纹。
 
 ### 2. 锁死那把钥匙
 
@@ -458,18 +470,23 @@ command="/usr/local/bin/agent-entry.sh",restrict ssh-ed25519 AAAA…cloud-agent
 **方案 B（推荐 —— 给对面写权限时必须用这个）** —— 在 `/etc/ssh/sshd_config` 里用 `Match` 块：
 
 ```sshconfig
-Match User your-user
+# ⚠️ Match 的是「整个用户」，不是某一把钥匙：必须是专给 AI 的独立账号，
+#    千万别写你自己登录用的账号，否则你自己的钥匙也会被锁成只能跑入口脚本。
+Match User agent-ops
     ForceCommand /usr/local/bin/agent-entry.sh
     PermitTTY no
-    X11Forwarding no
-    AllowTcpForwarding no
-    PermitOpen none
+    DisableForwarding yes     # OpenSSH 7.4+：TCP、Unix socket、X11、agent 转发一次全关
+    PermitTunnel no
 ```
 
 ```bash
 # 改完先验证语法，再 reload（别直接 restart，语法错会把自己关在门外）
-sudo sshd -t && sudo systemctl reload ssh
+# Debian/Ubuntu 单元名是 ssh，RHEL/Fedora/Arch 是 sshd
+sudo sshd -t && (sudo systemctl reload ssh || sudo systemctl reload sshd)
 ```
+
+> 方案 B 也要把**公钥**放进 `~agent-ops/.ssh/authorized_keys`（建议照样带 `restrict`）——
+> `ForceCommand` 管的是「登录后跑什么」，不负责「谁能登录」。
 
 方案 B 的好处：**服务端强制**，账号改 `authorized_keys`、加新钥匙都逃不掉 ——
 这条也是我们给对面开了 `exec` 之后才补上的（先踩坑，后补课）。
@@ -477,9 +494,12 @@ sudo sshd -t && sudo systemctl reload ssh
 ### 3. 云端侧
 
 ```bash
-ssh -i ~/.ssh/agent_key -p 2222 user@your-host.example.com help
-ssh -i ~/.ssh/agent_key -p 2222 user@your-host.example.com verify
-ssh -i ~/.ssh/agent_key -p 2222 user@your-host.example.com 'exec systemctl --user restart my-service'
+# 端口 2222 只是示例：用你 sshd / 隧道实际暴露的端口
+# 第一次连之前，先在服务器上 ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub 拿到主机指纹，
+# 和云端看到的比对一致再连 —— 别盲接 StrictHostKeyChecking=no
+ssh -i ~/.ssh/agent_key -p 2222 agent-ops@your-host.example.com help
+ssh -i ~/.ssh/agent_key -p 2222 agent-ops@your-host.example.com verify
+ssh -i ~/.ssh/agent_key -p 2222 agent-ops@your-host.example.com 'exec systemctl --user restart my-service'
 ```
 
 ### 4. 先审提权链，再开 `exec`
@@ -508,7 +528,7 @@ ssh -i ~/.ssh/agent_key -p 2222 user@your-host.example.com 'exec systemctl --use
 │   ├── alerts-and-receipts.md 告警与回执
 │   ├── deploy.md          部署步骤
 │   └── pitfalls.md        踩过的坑
-└── scripts/
+└── scripts/               （TODO：尚未提交。在此之前请照 docs/deploy.md 里的骨架自己写）
     ├── entry.sh           入口分发器模板（脱敏通用版）
     └── guard.sh           只读白名单模板（脱敏通用版）
 ```

@@ -223,14 +223,17 @@ class Notifier:
 
 **哨兵自己也会挂。** 如果哨兵挂了，你就永远收不到告警了。
 
-**做法**：让哨兵写**心跳文件**，再用**另一条路**检查心跳新鲜度。
+**做法**：让哨兵写**心跳**，再用**另一条路**检查心跳新鲜度。
+
+⚠️ 哨兵在云端，它写的心跳文件也在云端 —— 本机 cron 读不到。心跳得**落到本机**：
+最省事的是把每轮 `verify` 调用本身当心跳（入口脚本收到 `verify` 时写一个时间戳），或者用外部心跳服务。
 
 ```bash
-# 哨兵每轮写：
-echo "$(date -Is)" > ~/.local/state/sentinel.heartbeat
+# 入口脚本收到 verify 时顺手写（本机）：
+date -Is > /home/agent-ops/.local/state/sentinel.heartbeat
 
 # 本机 cron 每 10 分钟查：
-if [ $(( $(date +%s) - $(stat -c %Y ~/.local/state/sentinel.heartbeat) )) -gt 1800 ]; then
+if [ $(( $(date +%s) - $(stat -c %Y /home/agent-ops/.local/state/sentinel.heartbeat) )) -gt 1800 ]; then
     echo "⚠️ 哨兵 30 分钟没动了"
 fi
 ```

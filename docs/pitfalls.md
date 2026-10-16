@@ -32,7 +32,7 @@ Write denied: '~/.ssh/authorized_keys' is a protected system/credential file.
 
 **这是对的** —— 那个文件确实该被保护。
 
-**绕过方法：转发壳。** 把 `command=` 已经指向的那个**普通文件**改成转发：
+**替代做法：转发壳**（只适合**还没开 `exec`** 的阶段）。把 `command=` 已经指向的那个**普通文件**改成转发：
 
 ```bash
 #!/usr/bin/env bash
@@ -47,7 +47,8 @@ exec /usr/local/bin/agent-entry.sh "$SSH_ORIGINAL_COMMAND"
 **⚠️ 但**：如果那个壳归对面所有，**它也能改这个壳**。
 所以壳里**不能放护栏** —— 护栏必须在 root 拥有的脚本里。
 
-**教训**：受保护文件别硬绕。**找一个"它不是受保护文件"的等价位置。**
+**教训**：受保护文件别硬绕。真要改入口，**让机主用 root 改 `ForceCommand`**；
+转发壳只是只读阶段的过渡，开 `exec` 前必须拆掉，否则它能改壳 = 改入口。
 
 ---
 
@@ -227,6 +228,9 @@ cat ~/.ssh/id_repo.pub
 ```
 
 **教训**：**公钥可以随便传，私钥永远不要经过任何中间通道。**
+
+⚠️ 沙盒里的私钥是半公开的（见[威胁模型](threat-model.md)）—— 给它的 deploy key **只勾只读**。
+GitHub 的 deploy key 一旦勾了 write，就是整仓库、所有分支的写权限，没法限到某个分支。
 
 ---
 

@@ -64,12 +64,13 @@ command="/usr/local/bin/agent-entry.sh",restrict ssh-ed25519 AAAA…cloud-agent
 ### 方案 B：`sshd_config` 的 `ForceCommand`（推荐）
 
 ```sshconfig
-Match User your-user
+# ⚠️ Match 的是「整个用户」，不是某一把钥匙：必须是专给 AI 的独立账号，
+#    千万别写你自己登录用的账号，否则你自己的钥匙也会被锁成只能跑入口脚本。
+Match User agent-ops
     ForceCommand /usr/local/bin/agent-entry.sh
     PermitTTY no
-    X11Forwarding no
-    AllowTcpForwarding no
-    PermitOpen none
+    DisableForwarding yes     # OpenSSH 7.4+：TCP、Unix socket、X11、agent 转发一次全关
+    PermitTunnel no
 ```
 
 ```bash
@@ -106,7 +107,7 @@ sudo install -o root -g root -m 755 agent-entry.sh /usr/local/bin/agent-entry.sh
 ```
 /usr/local/bin/agent-entry.sh   root:root 755   ← 护栏，改不了
 ~/agent-workspace/              user:user 700   ← 它能随便写
-~/.hermes/logs/*.log            user:user       ← 审计
+journald（logger -t agent-entry）  ← 审计（别放它自己可写的文件里）
 ```
 
 **护栏和作业区物理分离** —— 这是整个设计的核心。
@@ -116,13 +117,15 @@ sudo install -o root -g root -m 755 agent-entry.sh /usr/local/bin/agent-entry.sh
 ## ③ 分发器：只认具名动作
 
 ```bash
-case "$1" in
+# sshd 不给入口脚本传位置参数，原命令在 $SSH_ORIGINAL_COMMAND 里
+CMD="${SSH_ORIGINAL_COMMAND:-help}"
+case "${CMD%% *}" in
   status)  do_status  ;;
   verify)  do_verify  ;;
   fix)     do_fix     ;;
-  exec)    do_exec "$@" ;;   # ← 唯一"像 shell"的，配护栏
+  exec)    do_exec "${CMD#exec }" ;;   # ← 唯一"像 shell"的，配护栏
   help)    do_help    ;;
-  *)       echo '{"error":"unknown action"}'; exit 2 ;;
+  *)       echo '{"error":"unknown action"}' >&2; exit 126 ;;
 esac
 ```
 

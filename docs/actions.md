@@ -167,7 +167,8 @@ ssh ... 'exec echo a; rm -rf /tmp/x'       # ⛔ 元字符（`;`）
 ### 工作区
 
 ```bash
-ssh ... 'exec echo "echo hi" > ~/agent-workspace/hello.sh && bash ~/agent-workspace/hello.sh'
+ssh ... 'exec tee agent-workspace/hello.sh' < hello.sh   # 内容走 stdin，命令里没有元字符
+ssh ... 'exec bash agent-workspace/hello.sh'
 ```
 
 `~/agent-workspace/` 是**给它的可写区**。它在这儿写脚本、跑脚本、迭代。
@@ -182,7 +183,7 @@ ssh ... 'exec echo "echo hi" > ~/agent-workspace/hello.sh && bash ~/agent-worksp
 2026-10-15T00:12:33+08:00  from=<来源>  rc=0  cmd=<命令>
 ```
 
-路径建议 `~/.hermes/logs/remote-agent-exec.log`。
+建议写进 journald（`logger -t agent-entry`），**不要**写进它自己可写的文件 —— 否则它能删掉自己的记录。
 
 **审计是事后手段，不能替代护栏** —— 但它是唯一能回答"昨晚到底谁改了什么"的东西。
 

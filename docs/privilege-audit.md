@@ -28,11 +28,19 @@
 ### 第 1 步：列出它能写的地方
 
 ```bash
-# 它拥有的目录
-find / -user "$USER" -type d -writable 2>/dev/null | head -50
+# 一定要以【它的账号】去查，而不是你自己 —— 你跑的时候 $USER 是你。
+# 查「能写」而不是「拥有」：组可写、其他人可写的目录同样算。
+sudo -u agent-ops find / -xdev -writable \
+     -not -path '/proc/*' -not -path '/sys/*' -not -path '/home/agent-ops/*' 2>/dev/null | head -100
 
-# 它拥有的可执行文件
-find / -user "$USER" -type f -perm -u+x 2>/dev/null | head -50
+# 它在哪些组里（下面任何一个都 ≈ root，必须移出）
+id agent-ops          # 危险组：sudo wheel admin docker lxd libvirt disk adm shadow
+
+# sudo 给它开了什么（期望："is not allowed to run sudo"）
+sudo -l -U agent-ops
+
+# 能直接摸到的特权 socket
+ls -l /var/run/docker.sock /run/podman/podman.sock 2>/dev/null
 ```
 
 典型答案：家目录、`~/.config`、`~/agent-workspace/`、`~/.hermes/`。
@@ -47,13 +55,13 @@ sudo crontab -l
 
 # ② 系统级 cron
 sudo ls -la /etc/cron.d/ /etc/cron.daily/ /etc/cron.hourly/ 2>/dev/null
-sudo grep -rn "$USER\|/home/" /etc/cron.d/ /etc/crontab 2>/dev/null
+sudo grep -rn "agent-ops\|/home/" /etc/cron.d/ /etc/crontab 2>/dev/null
 
 # ③ 系统级 systemd（注意：不是 --user！）
-sudo grep -rln "$USER\|/home/" /etc/systemd/system/ /lib/systemd/system/ 2>/dev/null
+sudo grep -rln "agent-ops\|/home/" /etc/systemd/system/ /lib/systemd/system/ 2>/dev/null
 
 # ④ 别的提权入口
-sudo grep -rn "$USER" /etc/sudoers /etc/sudoers.d/ 2>/dev/null
+sudo grep -rn "agent-ops" /etc/sudoers /etc/sudoers.d/ 2>/dev/null
 ```
 
 ### 第 3 步：判断
